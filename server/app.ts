@@ -1,4 +1,4 @@
-// The Hono app factory (spec B, D and F). Everything is served under /job-tracker.
+// The Hono app factory (spec B, D, E and F). Everything is served under /job-tracker.
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -6,6 +6,10 @@ import { sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { createRateLimiter } from "./auth/agent.ts";
+import { apiAuth, htmlGate } from "./auth/middleware.ts";
+import { API_PATH, AUTH_PATH, BASE_PATH, HEALTHZ_PATH, isApiPath, isAuthPath, looksLikeFile } from "./auth/paths.ts";
+import authRoutes from "./auth/routes.ts";
 import { type AppDeps, type AppEnv, jsonError } from "./context.ts";
 import applicationRoutes from "./features/applications/routes.ts";
 import contactRoutes from "./features/contacts/routes.ts";
@@ -14,30 +18,13 @@ import openapiRoutes from "./features/openapi/routes.ts";
 import viewRoutes from "./features/views/routes.ts";
 
 export type { AppDeps } from "./context.ts";
-
-export const BASE_PATH = "/job-tracker";
-export const API_PATH = `${BASE_PATH}/api`;
+export { API_PATH, BASE_PATH } from "./auth/paths.ts";
 
 const BODY_METHODS = new Set(["POST", "PATCH", "PUT"]);
-
-function isApiPath(path: string): boolean {
-  return path === API_PATH || path.startsWith(`${API_PATH}/`);
-}
-
-/** Auth routes (F2) take OAuth redirects and form posts, so they skip the media-type check. */
-function isAuthPath(path: string): boolean {
-  return path === `${API_PATH}/auth` || path.startsWith(`${API_PATH}/auth/`);
-}
 
 function isJsonContentType(header: string | undefined): boolean {
   if (!header) return false;
   return header.split(";")[0].trim().toLowerCase() === "application/json";
-}
-
-/** A path whose last segment contains a dot names a file (asset), never an SPA route. */
-function looksLikeFile(path: string): boolean {
-  const last = path.slice(path.lastIndexOf("/") + 1);
-  return last.includes(".");
 }
 
 export function createApp(deps: AppDeps): Hono<AppEnv> {
@@ -51,21 +38,36 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     c.header("X-Robots-Tag", "noindex");
   });
 
-  // 415 before routing, so unknown routes get it too.
-  app.use(`${API_PATH}/*`, async (c, next) => {
-    if (BODY_METHODS.has(c.req.method) && !isAuthPath(c.req.path) && !isJsonContentType(c.req.header("content-type"))) {
+  // Authentication, registered with app.use on this app so every /api route (including any added
+  // after createApp) sits behind it. The public auth routes (login, callback, logout) skip it.
+  // The rate limiter lives with this app instance.
+  app.use("*", apiAuth(createRateLimiter()));
+
+  // HTML pages need a session; the login page and static assets are public.
+  app.use("*", htmlGate());
+
+  // 415 after auth and before routing, so unknown routes get it too. Auth routes are exempt.
+  app.use("*", async (c, next) => {
+    const path = c.req.path;
+    if (
+      isApiPath(path) &&
+      BODY_METHODS.has(c.req.method) &&
+      !isAuthPath(path) &&
+      !isJsonContentType(c.req.header("content-type"))
+    ) {
       return jsonError(c, 415, "Content-Type must be application/json");
     }
     await next();
   });
 
-  app.get(`${BASE_PATH}/healthz`, async (c) => {
+  app.get(HEALTHZ_PATH, async (c) => {
     await c.get("deps").db.execute(sql`select 1`);
     return c.json({ ok: true });
   });
 
   app.get(BASE_PATH, (c) => c.redirect(`${BASE_PATH}/${new URL(c.req.url).search}`, 301));
 
+  app.route(AUTH_PATH, authRoutes);
   for (const routes of [applicationRoutes, contactRoutes, viewRoutes, exportRoutes, openapiRoutes]) {
     app.route(API_PATH, routes);
   }

@@ -21,8 +21,11 @@ export type RequestDeps = AppDeps & { now: () => Date; fetch: typeof fetch };
 
 export type AppVariables = {
   deps: RequestDeps;
+  /** Set by the auth middleware on every authenticated /api request. */
   actor: Actor;
   authVia: AuthVia;
+  /** The signed-in GitHub login for a session, "claude-project" for the agent key. */
+  login: string;
 };
 
 /** The Hono environment: `new Hono<AppEnv>()` gives typed c.get("deps"), c.get("actor") and c.get("authVia"). */

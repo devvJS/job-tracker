@@ -7,6 +7,8 @@ import { createTestDb } from "../helpers/db.ts";
 import { testConfig, TEST_NOW } from "../helpers/config.ts";
 import { buildTestApp } from "../helpers/app.ts";
 import { TEST_AGENT_KEY } from "../helpers/config.ts";
+import { signIn } from "../helpers/auth.ts";
+import { createFakeGithub } from "../helpers/github.ts";
 
 type Built = Awaited<ReturnType<typeof buildTestApp>>;
 let built: Built | undefined;
@@ -105,17 +107,19 @@ describe("foundation routes", () => {
 describe("static serving and SPA fallback", () => {
   const INDEX = '<!doctype html><html><body><div id="root">SPA-INDEX-MARKER</div></body></html>';
   const ASSET = "console.log('asset-content-marker');\n";
+  // F2 gates the HTML pages behind a session; a real one is obtained through the fake GitHub.
+  const sessionFor = async () => (await signIn(built!.app)).headers;
 
   beforeEach(async () => {
     tmp = await mkdtemp(join(tmpdir(), "jt-static-"));
     await writeFile(join(tmp, "index.html"), INDEX);
     await mkdir(join(tmp, "assets"));
     await writeFile(join(tmp, "assets", "app.js"), ASSET);
-    built = await buildTestApp({ config: { staticDir: tmp } });
+    built = await buildTestApp({ config: { staticDir: tmp }, fetch: createFakeGithub().fetch });
   });
 
   it("/job-tracker/ serves index.html", async () => {
-    const res = await built!.app.request("/job-tracker/");
+    const res = await built!.app.request("/job-tracker/", { headers: await sessionFor() });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     expect(res.headers.get("x-robots-tag")).toBe("noindex");
@@ -123,8 +127,15 @@ describe("static serving and SPA fallback", () => {
   });
 
   it("a deep link falls back to index.html", async () => {
-    for (const path of ["/job-tracker/applications/acme--eng--2026-10-07", "/job-tracker/due", "/job-tracker/login"]) {
-      const res = await built!.app.request(path);
+    // /login is public when signed out (with a session it redirects), so it is requested without one.
+    const session = await sessionFor();
+    const cases: [string, Record<string, string>][] = [
+      ["/job-tracker/applications/acme--eng--2026-10-07", session],
+      ["/job-tracker/due", session],
+      ["/job-tracker/login", {}],
+    ];
+    for (const [path, headers] of cases) {
+      const res = await built!.app.request(path, { headers });
       expect(res.status, path).toBe(200);
       expect(res.headers.get("content-type"), path).toContain("text/html");
       expect(res.headers.get("x-robots-tag"), path).toBe("noindex");
@@ -182,12 +193,12 @@ describe("foundation routes: gap coverage", () => {
     expect(text).not.toContain("\n");
   });
 
-  it("auth routes are exempt from the 415 check (404 until F2 adds them)", async () => {
+  it("auth routes are exempt from the 415 check (F2 adds them: logout 204, callback state check 400)", async () => {
     built = await buildTestApp();
     const res = await built.app.request("/job-tracker/api/auth/logout", { method: "POST" });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(204);
     const res2 = await jsonPost(built.app, "/job-tracker/api/auth/callback", { "Content-Type": "text/plain" });
-    expect(res2.status).toBe(404);
+    expect(res2.status).toBe(400);
   });
 
   it("a sibling path that merely starts with auth is not exempt", async () => {
