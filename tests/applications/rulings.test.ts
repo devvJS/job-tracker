@@ -159,3 +159,45 @@ describe("int4 boundaries are exact", () => {
     expect(detailPaths(r.json)).toContain(field);
   });
 });
+
+describe("event `at` must have a year from 1000 to 9999", () => {
+  it.each(["0000-01-01T00:00:00Z", "0999-12-31T23:59:59.999Z"])("%s is 400 naming `at`, and no event is written", async (at) => {
+    h = await setup();
+    await h.create(base());
+    const r = await h.call("POST", `${url}/events`, { body: { type: "note", at } });
+    expectEnvelope(r, 400, "bad_request");
+    expect(detailPaths(r.json)).toContain("at");
+    expect((await h.counts()).events).toBe(1);
+  });
+  it.each(["1000-01-01T00:00:00Z", "9999-12-31T23:59:59.999Z"])("%s is accepted", async (at) => {
+    h = await setup();
+    await h.create(base());
+    const r = await h.call("POST", `${url}/events`, { body: { type: "note", at } });
+    expect(r.status).toBe(201);
+    expect(r.json.event.at).toBe(new Date(at).toISOString());
+    expect((await h.counts()).events).toBe(2);
+    expect((await h.get(ACME_ID)).events.map((e: { at: string }) => e.at)).toContain(new Date(at).toISOString());
+  });
+});
+
+describe("event `at` year range is judged in UTC, whatever the host timezone", () => {
+  it.each([
+    ["1000-01-01T05:00:00+05:00", 201, "1000-01-01T00:00:00.000Z"],
+    ["1000-01-01T04:59:59.999+05:00", 400, null],
+    ["9999-12-31T18:59:59.999-05:00", 201, "9999-12-31T23:59:59.999Z"],
+    ["9999-12-31T19:00:00-05:00", 400, null],
+  ])("%s -> %i", async (at, status, stored) => {
+    h = await setup();
+    await h.create(base());
+    const r = await h.call("POST", `${url}/events`, { body: { type: "note", at } });
+    expect(r.status).toBe(status);
+    if (stored) {
+      expect(r.json.event.at).toBe(stored);
+      expect((await h.counts()).events).toBe(2);
+    } else {
+      expect(r.json.error.code).toBe("bad_request");
+      expect(detailPaths(r.json)).toContain("at");
+      expect((await h.counts()).events).toBe(1);
+    }
+  });
+});

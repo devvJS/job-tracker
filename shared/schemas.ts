@@ -117,7 +117,14 @@ export function isHttpUrl(value: string): boolean {
 }
 
 export const dateSchema = z.string().refine(isCalendarDate, { message: "Expected a real date as YYYY-MM-DD" });
-export const dateTimeSchema = z.iso.datetime({ offset: true, message: "Expected an ISO 8601 datetime" });
+/** True when the instant's UTC year is 1000-9999: earlier years read back as BC timestamps that Drizzle can't parse. */
+function inSupportedYearRange(value: string): boolean {
+  const year = new Date(value).getUTCFullYear();
+  return year >= 1000 && year <= 9999;
+}
+export const dateTimeSchema = z.iso
+  .datetime({ offset: true, abort: true, message: "Expected an ISO 8601 datetime" })
+  .refine(inSupportedYearRange, { message: "Datetime year must be from 1000 to 9999 (UTC)" });
 export const urlSchema = z.string().refine(isHttpUrl, { message: "Expected an absolute http(s) URL" });
 const nonBlank = z.string().refine((s) => s.trim().length > 0, { message: "Must not be blank" });
 const score = z.int().min(0).max(100);
