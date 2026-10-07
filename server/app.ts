@@ -27,15 +27,40 @@ function isJsonContentType(header: string | undefined): boolean {
   return header.split(";")[0].trim().toLowerCase() === "application/json";
 }
 
+/** Vite build output: `/job-tracker/assets/<name>-<hash>.<ext>`, the hash being 8+ base64url characters. */
+const HASHED_ASSET = new RegExp(`^${BASE_PATH}/assets/[^/]+-[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9]+$`);
+
+const NO_STORE = "no-store";
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+/**
+ * The Cache-Control a response under /job-tracker gets, or undefined to leave it alone.
+ * - HTML (index.html, the SPA fallback, /login) and temporary redirects (the auth gate, OAuth):
+ *   no-store, so a browser never replays a signed-out page or a stale redirect.
+ * - /api: no-store, since every response depends on the session or key.
+ * - Hashed build assets: cached for a year, immutable (a new build gets new names).
+ * Anything else (non-hashed files, healthz, the permanent /job-tracker redirect) keeps the default.
+ */
+function cacheControlFor(path: string, res: Response): string | undefined {
+  if (path !== BASE_PATH && !path.startsWith(`${BASE_PATH}/`)) return undefined;
+  if (isApiPath(path)) return NO_STORE;
+  if ([302, 303, 307].includes(res.status)) return NO_STORE;
+  if ((res.headers.get("content-type") ?? "").toLowerCase().startsWith("text/html")) return NO_STORE;
+  if (res.status === 200 && HASHED_ASSET.test(path)) return IMMUTABLE;
+  return undefined;
+}
+
 export function createApp(deps: AppDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  // Per-request deps (now and fetch always present), and noindex on every response,
-  // including errors, redirects and static files.
+  // Per-request deps (now and fetch always present), noindex on every response (including
+  // errors, redirects and static files), and the Cache-Control policy (see cacheControlFor).
   app.use("*", async (c, next) => {
     c.set("deps", { ...deps, now: deps.now ?? (() => new Date()), fetch: deps.fetch ?? fetch });
     await next();
     c.header("X-Robots-Tag", "noindex");
+    const cacheControl = cacheControlFor(c.req.path, c.res);
+    if (cacheControl !== undefined) c.header("Cache-Control", cacheControl);
   });
 
   // Authentication, registered with app.use on this app so every /api route (including any added
