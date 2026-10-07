@@ -68,9 +68,11 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   app.get(BASE_PATH, (c) => c.redirect(`${BASE_PATH}/${new URL(c.req.url).search}`, 301));
 
   app.route(AUTH_PATH, authRoutes);
-  for (const routes of [applicationRoutes, contactRoutes, viewRoutes, exportRoutes, openapiRoutes]) {
-    app.route(API_PATH, routes);
-  }
+  app.route(API_PATH, applicationRoutes);
+  app.route(API_PATH, contactRoutes);
+  app.route(API_PATH, viewRoutes);
+  app.route(API_PATH, exportRoutes);
+  app.route(API_PATH, openapiRoutes);
 
   // Static UI build with SPA fallback. /api paths never reach it.
   const root = resolve(deps.config.staticDir);

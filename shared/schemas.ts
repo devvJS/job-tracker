@@ -167,8 +167,9 @@ const applicationOptionalFields = {
   onsite_requirement: z.string().nullable().optional(),
   remote_scope: z.string().nullable().optional(),
   move_timing_ok: z.enum(MOVE_TIMING).nullable().optional(),
-  comp_min: z.int().nullable().optional(),
-  comp_max: z.int().nullable().optional(),
+  // Bounded to the Postgres integer (int4) column range, so an oversized value is a 400, not a 500.
+  comp_min: z.int().min(-2147483648).max(2147483647).nullable().optional(),
+  comp_max: z.int().min(-2147483648).max(2147483647).nullable().optional(),
   comp_source: z.enum(COMP_SOURCES).nullable().optional(),
   equity_bonus_notes: z.string().nullable().optional(),
   track: z.enum(TRACKS).nullable().optional(),
