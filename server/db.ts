@@ -1,5 +1,7 @@
 // Database connection and migrations (spec B).
 // postgres:// and postgresql:// URLs use node-postgres; pglite:// URLs use PGlite.
+import { mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { is } from "drizzle-orm";
@@ -22,7 +24,8 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("../db/migrations", import.meta.
  * Opens a database from a URL:
  * - `postgres://...` or `postgresql://...`: a node-postgres pool
  * - `pglite://memory`: a fresh in-memory PGlite
- * - `pglite://<dir>`: PGlite stored on disk in <dir>
+ * - `pglite://<dir>`: PGlite stored on disk in <dir> (absolute, or relative to the cwd);
+ *   the directory and any missing parents are created, since PGlite makes only the leaf
  */
 export async function createDb(url: string): Promise<{ db: Db; close: () => Promise<void> }> {
   if (/^postgres(ql)?:\/\//.test(url)) {
@@ -33,7 +36,14 @@ export async function createDb(url: string): Promise<{ db: Db; close: () => Prom
   if (url.startsWith("pglite://")) {
     const location = url.slice("pglite://".length);
     if (location === "") throw new Error("pglite:// URL needs a location: pglite://memory or pglite://<dir>");
-    const client = location === "memory" ? new PGlite() : new PGlite(location);
+    let client: PGlite;
+    if (location === "memory") {
+      client = new PGlite();
+    } else {
+      const dir = resolve(location);
+      await mkdir(dir, { recursive: true });
+      client = new PGlite(dir);
+    }
     await client.waitReady;
     const db = drizzlePglite(client, { schema });
     return { db, close: () => client.close() };

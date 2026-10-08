@@ -1,5 +1,9 @@
 import { createDb, migrate } from "../../server/db.ts";
 import { createTestDb, type TestDb } from "../helpers/db.ts";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { sql } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -175,5 +179,72 @@ describe("createDb and migrate", () => {
       defs.some((d) => d.startsWith("events: ") && /\("?application_id"?, "?at"?\)/.test(d)),
       "events index on (application_id, at)",
     ).toBe(true);
+  });
+});
+
+describe("createDb on-disk PGlite with a missing parent directory", () => {
+  async function roundTrip(url: string, dir: string) {
+    const first = await createDb(url);
+    try {
+      await migrate(first.db);
+      await first.db.execute(sql`update settings set value = '175000'::jsonb where key = 'comp_floor'`);
+    } finally {
+      await first.close();
+    }
+    expect(existsSync(dir)).toBe(true);
+
+    const second = await createDb(url);
+    try {
+      await migrate(second.db);
+      const res = (await second.db.execute(sql`select value from settings where key = 'comp_floor'`)) as unknown as {
+        rows: { value: unknown }[];
+      };
+      expect(res.rows).toEqual([{ value: 175000 }]);
+    } finally {
+      await second.close();
+    }
+  }
+
+  it("creates every missing parent of an absolute path, and the data persists on reopen", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "jt-pglite-"));
+    try {
+      const dir = join(tmp, "does", "not", "exist", "yet", "db");
+      await roundTrip(`pglite://${dir}`, dir);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("creates every missing parent of a relative path (resolved against the cwd)", async () => {
+    const rel = `.tmp-pglite-test-${process.pid}-${Date.now()}`;
+    try {
+      const relDir = `${rel}/a/b/db`;
+      await roundTrip(`pglite://${relDir}`, join(process.cwd(), relDir));
+    } finally {
+      await rm(join(process.cwd(), rel), { recursive: true, force: true });
+    }
+  });
+
+  it("pglite://memory creates no 'memory' entry in the cwd", async () => {
+    const target = join(process.cwd(), "memory");
+    expect(existsSync(target)).toBe(false);
+    const h = await createDb("pglite://memory");
+    try {
+      await migrate(h.db);
+    } finally {
+      await h.close();
+    }
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("a regular file at the pglite path makes createDb reject with an error naming the path", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "jt-pglite-file-"));
+    try {
+      const file = join(tmp, "not-a-dir");
+      await writeFile(file, "x");
+      await expect(createDb(`pglite://${file}`)).rejects.toThrow(file);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
   });
 });
