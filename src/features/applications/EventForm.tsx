@@ -2,7 +2,7 @@ import { type FormEvent, useState } from "react";
 import { CLIENT_EVENT_TYPES, STATUSES } from "../../../shared/schemas.ts";
 import { ErrorBanner } from "../../components/ErrorBanner.tsx";
 import { inputClass, labelClass } from "./ApplicationForm.tsx";
-import { type EventResponse, detailsOf, postEvent } from "./applications-api.ts";
+import { detailsOf } from "./applications-api.ts";
 
 type Values = { type: string; note: string; status: string; next_action: string; next_action_due: string };
 
@@ -10,9 +10,10 @@ const EMPTY: Values = { type: "note", note: "", status: "", next_action: "", nex
 
 /**
  * Logs an event, optionally moving the status and setting the next action.
- * Empty optional fields are left out, so they leave the record unchanged.
+ * Empty optional fields are left out, so they leave the record unchanged. `onSubmit` posts the
+ * event (the page owns the write, so it can take the returned record); it rejects on failure.
  */
-export function EventForm(props: { applicationId: string; currentStatus: string; onLogged: (res: EventResponse) => void }) {
+export function EventForm(props: { currentStatus: string; onSubmit: (body: Record<string, unknown>) => Promise<void> }) {
   const [values, setValues] = useState<Values>(EMPTY);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -31,9 +32,8 @@ export function EventForm(props: { applicationId: string; currentStatus: string;
     setBusy(true);
     setError(null);
     try {
-      const res = await postEvent(props.applicationId, body);
+      await props.onSubmit(body);
       setValues(EMPTY);
-      props.onLogged(res);
     } catch (err) {
       setError(err);
     } finally {

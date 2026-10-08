@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { type ApplicationRecord, STATUSES, TRACKS, WORK_ARRANGEMENTS } from "../../../shared/schemas.ts";
 import { ErrorBanner } from "../../components/ErrorBanner.tsx";
+import { useLiveList } from "../../lib/record-sync.ts";
 import { type BoardFilters, NO_FILTERS, filterQuery, listApplications } from "./applications-api.ts";
 
 type Loaded = { query: string; items: ApplicationRecord[] | null; error: unknown };
@@ -13,6 +14,8 @@ const controlClass =
 export function BoardPage() {
   const [filters, setFilters] = useState<BoardFilters>(NO_FILTERS);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
+  // Changes to refetch silently: another tab's application write, or the tab becoming visible.
+  const refreshKey = useLiveList("application");
   const query = filterQuery(filters);
 
   useEffect(() => {
@@ -28,7 +31,7 @@ export function BoardPage() {
     return () => {
       active = false;
     };
-  }, [query]);
+  }, [query, refreshKey]);
 
   const set = <K extends keyof BoardFilters>(key: K, value: BoardFilters[K]) => setFilters((f) => ({ ...f, [key]: value }));
   const loading = loaded === null || loaded.query !== query;

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import type { ContactRecord } from "../../../shared/schemas.ts";
 import { ErrorBanner } from "../../components/ErrorBanner.tsx";
 import { ApiError } from "../../lib/api.ts";
+import { isNewer, useLiveRefetch } from "../../lib/record-sync.ts";
+import { StaleBanner } from "../../lib/StaleBanner.tsx";
 import { ContactForm } from "./ContactForm.tsx";
 import { ContactList } from "./ContactList.tsx";
 import { type ContactFormValues, createContact, listContacts, updateContact, upsertContact, valuesOf } from "./contacts-api.ts";
@@ -59,6 +61,19 @@ export function ContactsPage() {
   const reload = () => {
     setLoadError(null);
     setReloadKey((k) => k + 1);
+  };
+
+  // Live sync (spec I): refetch silently on another tab's contact write and when the tab becomes visible.
+  useLiveRefetch("contact", () => setReloadKey((k) => k + 1));
+
+  // The contact being edited, as the list now has it. `editing` stays as it was when the edit began
+  // (it is the If-Match), so a newer copy in the list means it changed elsewhere meanwhile.
+  const latestEditing = editing && items ? (items.find((c) => c.id === editing.id) ?? null) : null;
+  const stale = editing !== null && latestEditing !== null && !busy && isNewer(latestEditing.updated_at, editing.updated_at);
+
+  /** Discards the typed edits and reopens the form on the latest version. */
+  const reloadLatest = () => {
+    if (latestEditing) startEdit(latestEditing);
   };
 
   const startEdit = (record: ContactRecord) => {
@@ -131,6 +146,7 @@ export function ContactsPage() {
               )}
             </div>
           )}
+          {stale && <StaleBanner onReload={reloadLatest} />}
           <ContactForm
             key={`${editing?.id ?? "new"}:${formKey}`}
             initial={editing ? valuesOf(editing) : null}

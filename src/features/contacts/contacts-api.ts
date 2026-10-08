@@ -1,6 +1,7 @@
 // Contacts API calls for the UI, through the shared api() client.
 import type { ContactRecord } from "../../../shared/schemas.ts";
 import { api } from "../../lib/api.ts";
+import { publishRecord } from "../../lib/record-sync.ts";
 
 export type ContactList = { items: ContactRecord[]; count: number };
 
@@ -47,17 +48,23 @@ export function listContacts(): Promise<ContactList> {
   return api<ContactList>("/contacts");
 }
 
-export function createContact(values: ContactFormValues): Promise<ContactRecord> {
-  return api<ContactRecord>("/contacts", { method: "POST", body: bodyOf(values, "create") });
+// Every successful write is announced to the other tabs (spec I).
+
+export async function createContact(values: ContactFormValues): Promise<ContactRecord> {
+  const record = await api<ContactRecord>("/contacts", { method: "POST", body: bodyOf(values, "create") });
+  publishRecord("contact", record);
+  return record;
 }
 
 /** PATCHes with the record's updated_at as If-Match, exactly as the API returned it. */
-export function updateContact(record: ContactRecord, values: ContactFormValues): Promise<ContactRecord> {
-  return api<ContactRecord>(`/contacts/${encodeURIComponent(record.id)}`, {
+export async function updateContact(record: ContactRecord, values: ContactFormValues): Promise<ContactRecord> {
+  const updated = await api<ContactRecord>(`/contacts/${encodeURIComponent(record.id)}`, {
     method: "PATCH",
     body: bodyOf(values, "edit"),
     headers: { "If-Match": record.updated_at },
   });
+  publishRecord("contact", updated);
+  return updated;
 }
 
 /** Sorted like the API sorts: by name (case-insensitive), then name, then id. */

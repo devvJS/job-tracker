@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { ErrorBanner } from "../../components/ErrorBanner.tsx";
+import { useLiveList } from "../../lib/record-sync.ts";
 import { type DueItem, type DueResponse, dueQuery, getDue, localToday } from "./views-api.ts";
 
 type Loaded = { query: string; data: DueResponse | null; error: unknown };
@@ -13,6 +14,8 @@ export function DuePage() {
   const [date, setDate] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const query = dueQuery(date);
+  // Changes to refetch silently: another tab's application write, or the tab becoming visible (spec I).
+  const refreshKey = useLiveList("application");
 
   useEffect(() => {
     let active = true;
@@ -27,7 +30,7 @@ export function DuePage() {
     return () => {
       active = false;
     };
-  }, [query]);
+  }, [query, refreshKey]);
 
   // Only the result for the date currently asked for is shown.
   const current = loaded !== null && loaded.query === query ? loaded : null;

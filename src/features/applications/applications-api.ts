@@ -1,6 +1,7 @@
 // API calls and form-value conversion for the applications pages.
 import type { ApplicationRecord, EventRecord } from "../../../shared/schemas.ts";
 import { ApiError, api } from "../../lib/api.ts";
+import { publishDelete, publishRecord } from "../../lib/record-sync.ts";
 
 export type ListResponse = { items: ApplicationRecord[]; count: number };
 export type EventResponse = { event: EventRecord; record: ApplicationRecord };
@@ -46,26 +47,35 @@ export function getApplication(id: string): Promise<ApplicationRecord> {
   return api<ApplicationRecord>(`/applications/${encodeURIComponent(id)}`);
 }
 
-export function createApplication(body: Record<string, unknown>): Promise<ApplicationRecord> {
-  return api<ApplicationRecord>("/applications", { method: "POST", body });
+// Every successful write is announced to the other tabs (spec I).
+
+export async function createApplication(body: Record<string, unknown>): Promise<ApplicationRecord> {
+  const record = await api<ApplicationRecord>("/applications", { method: "POST", body });
+  publishRecord("application", record);
+  return record;
 }
 
-/** PATCH with If-Match = the updated_at of the record the edit started from. */
-export function patchApplication(record: ApplicationRecord, body: Record<string, unknown>): Promise<ApplicationRecord> {
-  return api<ApplicationRecord>(`/applications/${encodeURIComponent(record.id)}`, {
+/** PATCH with If-Match = an updated_at exactly as the API returned it. */
+export async function patchApplication(id: string, ifMatch: string, body: Record<string, unknown>): Promise<ApplicationRecord> {
+  const updated = await api<ApplicationRecord>(`/applications/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body,
-    headers: { "If-Match": record.updated_at },
+    headers: { "If-Match": ifMatch },
   });
+  publishRecord("application", updated);
+  return updated;
 }
 
-export function postEvent(id: string, body: Record<string, unknown>): Promise<EventResponse> {
-  return api<EventResponse>(`/applications/${encodeURIComponent(id)}/events`, { method: "POST", body });
+export async function postEvent(id: string, body: Record<string, unknown>): Promise<EventResponse> {
+  const res = await api<EventResponse>(`/applications/${encodeURIComponent(id)}/events`, { method: "POST", body });
+  publishRecord("application", res.record);
+  return res;
 }
 
-export function deleteApplication(id: string): Promise<void> {
+export async function deleteApplication(id: string): Promise<void> {
   const enc = encodeURIComponent(id);
-  return api<void>(`/applications/${enc}?confirm=${enc}`, { method: "DELETE" });
+  await api<void>(`/applications/${enc}?confirm=${enc}`, { method: "DELETE" });
+  publishDelete("application", id);
 }
 
 // ---------------------------------------------------------------------------

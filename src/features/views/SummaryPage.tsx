@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { STATUSES } from "../../../shared/schemas.ts";
 import { ErrorBanner } from "../../components/ErrorBanner.tsx";
+import { useLiveList } from "../../lib/record-sync.ts";
 import { type SourceRow, type SummaryResponse, getSummary } from "./views-api.ts";
 
 /** /summary: the weekly counts, the current status breakdown and the all-time source table. */
 export function SummaryPage() {
   const [data, setData] = useState<SummaryResponse | null>(null);
   const [error, setError] = useState<unknown>(null);
+  // Changes to refetch silently: another tab's application write, or the tab becoming visible (spec I).
+  const refreshKey = useLiveList("application");
 
   useEffect(() => {
     let active = true;
@@ -25,7 +28,7 @@ export function SummaryPage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [refreshKey]);
 
   return (
     <section className="mx-auto max-w-4xl space-y-6">
