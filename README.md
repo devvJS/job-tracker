@@ -21,18 +21,22 @@ DATABASE_URL=pglite://.data/dev npm run seed      # the six seed applications
 FAKE_GITHUB_PORT=3001 node e2e/support/fake-github.ts
 
 # terminal 2: the app
-DATABASE_URL=pglite://.data/dev PUBLIC_URL=http://localhost:3000 \
+DATABASE_URL=pglite://.data/dev PORT=3100 PUBLIC_URL=http://localhost:3100 \
 SESSION_SECRET=$(openssl rand -hex 32) TRACKER_AGENT_KEY=local-agent-key-0123456789abcdefghij \
 GITHUB_CLIENT_ID=local GITHUB_CLIENT_SECRET=local \
 GITHUB_OAUTH_URL=http://localhost:3001 GITHUB_API_URL=http://localhost:3001 \
 npm start
 ```
 
-Open <http://localhost:3000/job-tracker/> and sign in. To act as the agent:
+Open <http://localhost:3100/job-tracker/> and sign in. `PUBLIC_URL` must match the
+port the app listens on, because the sign-in callback is built from it.
+Port 3100 is used here because 3000 is often taken by other dev servers.
+
+To act as the agent:
 
 ```bash
 curl -H "Authorization: Bearer local-agent-key-0123456789abcdefghij" \
-  http://localhost:3000/job-tracker/api/applications
+  http://localhost:3100/job-tracker/api/applications
 ```
 
 For day-to-day work, copy `.env.example` to `.env` and run `npm run dev`
