@@ -20,6 +20,9 @@ import viewRoutes from "./features/views/routes.ts";
 export type { AppDeps } from "./context.ts";
 export { API_PATH, BASE_PATH } from "./auth/paths.ts";
 
+/** Root alias of HEALTHZ_PATH for Railway, whose health-check path allows only letters, digits, "/" and "_". */
+const ROOT_HEALTHZ_PATH = "/healthz";
+
 const BODY_METHODS = new Set(["POST", "PATCH", "PUT"]);
 
 function isJsonContentType(header: string | undefined): boolean {
@@ -85,7 +88,9 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     await next();
   });
 
-  app.get(HEALTHZ_PATH, async (c) => {
+  // One public health check on two paths. Railway's health-check path field rejects the hyphen
+  // in /job-tracker/healthz, so /healthz serves the same handler.
+  app.on("GET", [HEALTHZ_PATH, ROOT_HEALTHZ_PATH], async (c) => {
     await c.get("deps").db.execute(sql`select 1`);
     return c.json({ ok: true });
   });

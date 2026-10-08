@@ -266,3 +266,44 @@ describe("deps contract", () => {
     expect(seen()!.now()).toEqual(TEST_NOW);
   });
 });
+
+describe("root healthz (Railway health check path)", () => {
+  it("GET /healthz -> 200 {ok:true}, public, noindex", async () => {
+    built = await buildTestApp();
+    const res = await built.app.request("/healthz");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(res.headers.get("x-robots-tag")).toBe("noindex");
+  });
+
+  it("/job-tracker/healthz still works unchanged", async () => {
+    built = await buildTestApp();
+    const res = await built.app.request("/job-tracker/healthz");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(res.headers.get("x-robots-tag")).toBe("noindex");
+  });
+
+  it("with the DB closed, /healthz returns the same 500 envelope as /job-tracker/healthz", async () => {
+    const b = await buildTestApp();
+    await b.close();
+    const root = await b.app.request("/healthz");
+    const prefixed = await b.app.request("/job-tracker/healthz");
+    expect(root.status).toBe(500);
+    expect(root.headers.get("x-robots-tag")).toBe("noindex");
+    const rootBody = (await root.json()) as { error: { code: string; message: string } };
+    expect(Object.keys(rootBody)).toEqual(["error"]);
+    expect(Object.keys(rootBody.error)).toEqual(["code", "message"]);
+    expect(rootBody.error.code).toBe("internal");
+    expect(prefixed.status).toBe(500);
+    expect(rootBody).toEqual(await prefixed.json());
+  });
+
+  it("other root paths still 404", async () => {
+    built = await buildTestApp();
+    for (const path of ["/foo", "/healthz/extra", "/api/x"]) {
+      const res = await built.app.request(path);
+      expect(res.status, path).toBe(404);
+    }
+  });
+});
