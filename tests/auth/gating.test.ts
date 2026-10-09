@@ -70,7 +70,7 @@ describe("API gating", () => {
     const app = await setup();
     const res = await app.request(`${BASE}/healthz`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
   });
 
   it("an unknown /api path with a session -> 404 envelope", async () => {
