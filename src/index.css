@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-charcoal font-sans text-ink antialiased;
+  }
+
+  /* JetBrains Mono for headings and labels, Inter for body text. */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  label,
+  th {
+    @apply font-mono;
+  }
+
+  a {
+    @apply text-accent-cyan hover:text-accent-green;
+  }
+}

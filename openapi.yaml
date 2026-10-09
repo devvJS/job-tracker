@@ -1,0 +1,1107 @@
+openapi: 3.1.0
+info:
+  title: Job Tracker API
+  version: 1.0.0
+  description: |
+    The API behind devvjs.dev/job-tracker. It is the only writer of the tracker's data: the UI,
+    the "Job Search" Claude project and the seed script all go through it.
+
+    Paths below are relative to the server URL, e.g. `GET /applications` is
+    `GET https://devvjs.dev/job-tracker/api/applications`.
+
+    **Authentication.** Every route needs either the agent key
+    (`Authorization: Bearer <TRACKER_AGENT_KEY>`) or the owner's session cookie (`jt_session`),
+    except `GET /auth/login`, `GET|POST /auth/callback` and `POST /auth/logout`. A valid bearer key
+    wins over a cookie; any other bearer value is 401 even when a valid cookie is also sent. Writes
+    are recorded as `claude-project` (agent key), `dakota` (session) or `tracker-app` (server and
+    system writes such as the seed).
+
+    **Rate limit.** Each agent key may make `AGENT_RATE_LIMIT_PER_MINUTE` requests (default 60)
+    in a fixed one-minute window. Over the limit the API answers 429 with `Retry-After` (seconds).
+    Session requests are not limited.
+
+    **Formats.** JSON in and out. POST and PATCH bodies need `Content-Type: application/json`
+    (415 otherwise; the auth routes are exempt). Dates are `YYYY-MM-DD` and must be real calendar
+    dates. Datetimes are ISO 8601 with an offset on input, with a year from 1000 to 9999 (anything
+    else is 400 naming the field); the API returns them in UTC with
+    milliseconds and `Z` (e.g. `2026-10-07T14:00:00.000Z`). Enums are exact. Comp values are
+    integers (USD per year, base). Fit scores are integers 0-100. URLs are absolute http(s).
+
+    **Unknown fields.** On applications and contacts, top-level keys the API does not recognize are
+    stored in the record's `extra` column and returned as top-level fields on every read. On PATCH
+    they merge into `extra`, and sending `null` for one removes it. Server-managed keys (`id`,
+    `created_at`, `updated_at`, `updated_by`, `events`, `contacts`, `application_ids`,
+    `meets_floor`, `extra`) are ignored on input.
+
+    **Concurrency.** PATCH requires `If-Match` carrying the record's `updated_at` exactly as the API
+    returned it (compared as an instant). Missing gives 428; stale gives 412 with the current
+    record in `record`. Event appends (`POST /applications/{id}/events`) never return 412.
+
+    **Errors.** Every non-2xx JSON response is the `Error` envelope. 409 and 412 add a top-level
+    `record` holding the full current record.
+servers:
+  - url: https://devvjs.dev/job-tracker/api
+    description: Production (through the devvjs.dev site proxy)
+security:
+  - agentKey: []
+  - sessionCookie: []
+tags:
+  - name: applications
+    description: Job applications and their event log.
+  - name: contacts
+    description: People linked to applications through `contact_ids`.
+  - name: views
+    description: Due list and weekly summary.
+  - name: export
+    description: Full data dump.
+  - name: auth
+    description: GitHub sign-in for the owner's browser session. Agents use the bearer key instead.
+  - name: meta
+    description: The API contract.
+
+paths:
+  /applications:
+    get:
+      tags: [applications]
+      operationId: listApplications
+      summary: List applications, with filters
+      description: |
+        Returns `{ items, count }`, sorted by `updated_at` descending, then `id`. Each item is the
+        list record: it omits `events`, `contacts` and `contact_ids` (use `GET /applications/{id}`
+        for those). All filters combine with AND. An invalid parameter gives 400 naming it.
+        Search with `q` before creating, so you don't create a duplicate.
+      parameters:
+        - name: status
+          in: query
+          description: One status or a comma-separated list (any of), e.g. `applied,screen`.
+          schema: { type: string, example: "applied,screen" }
+        - name: track
+          in: query
+          schema: { $ref: "#/components/schemas/Track" }
+        - name: work_arrangement
+          in: query
+          schema: { $ref: "#/components/schemas/WorkArrangement" }
+        - name: detroit_metro
+          in: query
+          schema: { type: string, enum: ["true", "false"] }
+        - name: meets_floor
+          in: query
+          schema: { type: string, enum: ["true", "false"] }
+        - name: min_fit
+          in: query
+          description: |
+            Only records whose `fit.total` is at least this integer (records without a `fit.total`
+            never match). Any integer is accepted: fit scores are 0-100, so a value of 0 or less
+            matches every scored record and a value above 100 matches none.
+          schema: { type: integer }
+        - name: due_before
+          in: query
+          description: Records with `next_action_due <= date` or `follow_up_date <= date`.
+          schema: { type: string, format: date }
+        - name: q
+          in: query
+          description: Case-insensitive substring of `company` or `role_title`.
+          schema: { type: string }
+        - name: updated_since
+          in: query
+          description: |
+            Records with `updated_at >= t`. An ISO 8601 datetime with an offset and a year from 1000
+            to 9999; anything else is 400 `bad_request` naming `updated_since`.
+          schema: { type: string, format: date-time, example: "2026-10-01T00:00:00Z" }
+      responses:
+        "200":
+          description: The matching applications.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [applications]
+      operationId: createApplication
+      summary: Create an application
+      description: |
+        Required: `company`, `role_title`, `work_arrangement`, `status`. `discovered_at` defaults to
+        today (in the tracker's time zone). The server generates the id
+        `<slug(company)>--<slug(role_title)>--<discovered_at>`. If that id, or a record with the
+        same `posting_url` (trimmed, exact match), already exists, the answer is 409 with the
+        existing record in `record`: the record already exists, so use it instead of retrying.
+        A `discovered` event is added. `meets_floor` is computed from `comp_min`/`comp_max` and
+        the comp floor. Creating with status `applied` and no `applied_at` sets `applied_at` to
+        today; creating with `rejected`, `withdrawn` or `closed` and no `closed_at` sets
+        `closed_at` to today. Every `contact_ids` entry must name an existing contact (400
+        otherwise). Unknown top-level fields are preserved in `extra` and returned top-level.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApplicationCreate" }
+      responses:
+        "201":
+          description: Created. The full record, with `contact_ids`, `events` and `contacts`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Application" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ApplicationConflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /applications/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    get:
+      tags: [applications]
+      operationId: getApplication
+      summary: Get one application, with its events and contacts
+      description: |
+        The full record. `events` are sorted by `at` ascending, then id; `contacts` and
+        `contact_ids` are sorted by id.
+      responses:
+        "200":
+          description: The full record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Application" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    patch:
+      tags: [applications]
+      operationId: updateApplication
+      summary: Partially update an application
+      description: |
+        Requires `If-Match` with the `updated_at` you last saw. Only the fields you send change;
+        `null` clears an optional field (nulling a required field is 400). Unknown fields merge into
+        `extra` (returned top-level); `null` for one removes it. Sending `contact_ids` replaces the
+        whole set. A `status` change also inserts a `status-change` event (note
+        `"<from> → <to>"`) in the same transaction, and moving to `applied` with no `applied_at`,
+        or to `rejected`/`withdrawn`/`closed` with no `closed_at`, fills that date with today.
+        `meets_floor` is recomputed.
+
+        To log progress (a call, an interview, a status change), prefer
+        `POST /applications/{id}/events`, which never conflicts.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApplicationPatch" }
+      responses:
+        "200":
+          description: Updated. The full record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Application" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The `posting_url` you sent belongs to another record. `record` is that record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationConflictError" }
+        "412":
+          description: |
+            `If-Match` is stale (or not a datetime): the record changed since you read it. `record`
+            is the current record; re-apply your change on top of it and retry with its `updated_at`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationConflictError" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [applications]
+      operationId: deleteApplication
+      summary: Hard-delete an application (owner session only)
+      description: |
+        Permanently deletes the record, its events and its contact links. Only the signed-in owner
+        can do this: the agent key gets 403. `confirm` must equal the id. To take a record out of
+        the pipeline, set its status to `closed` or `withdrawn` instead.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must equal the id in the path.
+          schema: { type: string }
+      responses:
+        "204":
+          description: Deleted.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /applications/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    post:
+      tags: [applications]
+      operationId: addEvent
+      summary: Append an event, optionally changing status and next action
+      description: |
+        The preferred way to record progress. Never returns 412. Inserts the event (`at` defaults to
+        now). A `status` that differs from the current one also updates the status, inserts a
+        `status-change` event and fills `applied_at`/`closed_at` as for PATCH. `next_action` and
+        `next_action_due` are set when present (`null` clears them). Clients cannot post
+        `type: "status-change"` (400); the server creates those.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EventCreate" }
+      responses:
+        "201":
+          description: The new event and the full updated record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /contacts:
+    get:
+      tags: [contacts]
+      operationId: listContacts
+      summary: List contacts
+      description: Returns `{ items, count }` sorted by name. Each contact includes `application_ids`.
+      parameters:
+        - name: q
+          in: query
+          description: Case-insensitive substring of `name` or `company`.
+          schema: { type: string }
+      responses:
+        "200":
+          description: The matching contacts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContactList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [contacts]
+      operationId: createContact
+      summary: Create a contact
+      description: |
+        Required: `name`. The id is `<slug(name)>--<slug(company)>`, or `<slug(name)>` with no
+        company. A duplicate id gives 409 with the existing contact in `record`. Unknown top-level
+        fields are preserved in `extra` and returned top-level. Link a contact to an application
+        through the application's `contact_ids`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ContactCreate" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contact" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: A contact with this id already exists. `record` is that contact.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContactConflictError" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /contacts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, example: "jane-doe--ford" }
+    get:
+      tags: [contacts]
+      operationId: getContact
+      summary: Get one contact
+      responses:
+        "200":
+          description: The contact, with `application_ids`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contact" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    patch:
+      tags: [contacts]
+      operationId: updateContact
+      summary: Partially update a contact
+      description: |
+        Same rules as `PATCH /applications/{id}`: `If-Match` required, `null` clears an optional
+        field, unknown fields merge into `extra` (returned top-level) and `null` removes one.
+        The id never changes.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ContactPatch" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contact" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "412":
+          description: "`If-Match` is stale. `record` is the current contact."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContactConflictError" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /due:
+    get:
+      tags: [views]
+      operationId: getDue
+      summary: What is due on or before a date
+      description: |
+        Records whose status is not `rejected`, `withdrawn`, `closed` or `accepted`, where
+        `next_action_due <= date` or `follow_up_date <= date`. Each item is the list record plus
+        `due_on` (the earlier of the two dates) and `overdue` (`due_on < date`). Sorted by `due_on`,
+        then id.
+      parameters:
+        - name: date
+          in: query
+          description: Defaults to today in the tracker's time zone.
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: The due list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DueResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /summary:
+    get:
+      tags: [views]
+      operationId: getSummary
+      summary: Weekly summary counts
+      description: |
+        Counts over the inclusive window [`from`, `to`]. `to` defaults to today and `from` to
+        `to` minus 6 days. `from` after `to` is 400.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: The summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Summary" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /export:
+    get:
+      tags: [export]
+      operationId: getExport
+      summary: Full dump of every record
+      description: |
+        Every application (with `events` and `contact_ids`, without embedded `contacts`), every
+        contact (with `application_ids`), and the settings. Both lists are sorted by id.
+      responses:
+        "200":
+          description: The dump.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Export" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /openapi.yaml:
+    get:
+      tags: [meta]
+      operationId: getOpenApi
+      summary: This document
+      responses:
+        "200":
+          description: The OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /auth/login:
+    get:
+      tags: [auth]
+      operationId: login
+      summary: Start GitHub sign-in (browser only)
+      description: |
+        Redirects to GitHub's authorize page and sets the short-lived `jt_oauth_state` cookie.
+        Only the allowed GitHub login can finish signing in. Agents use the bearer key instead.
+      security: []
+      responses:
+        "302":
+          description: Redirect to GitHub.
+          headers:
+            Location:
+              schema: { type: string }
+            Set-Cookie:
+              description: "`jt_oauth_state` (HttpOnly, Secure, SameSite=Lax, Max-Age=600)."
+              schema: { type: string }
+  /auth/callback:
+    get:
+      tags: [auth]
+      operationId: oauthCallback
+      summary: GitHub OAuth callback (browser only)
+      description: |
+        Checks `state` against the `jt_oauth_state` cookie, exchanges `code` with GitHub and, when
+        the GitHub login is allowed, sets the `jt_session` cookie and redirects to `/job-tracker/`.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/OAuthCode"
+        - $ref: "#/components/parameters/OAuthState"
+      responses:
+        "302": { $ref: "#/components/responses/SignedIn" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [auth]
+      operationId: oauthCallbackPost
+      summary: GitHub OAuth callback, POST form (browser only)
+      description: Same as the GET form; `code` and `state` are still read from the query string.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/OAuthCode"
+        - $ref: "#/components/parameters/OAuthState"
+      responses:
+        "302": { $ref: "#/components/responses/SignedIn" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Sign out
+      description: Clears the session cookie. Needs no credentials and no body.
+      security: []
+      responses:
+        "204":
+          description: Signed out.
+  /auth/me:
+    get:
+      tags: [auth]
+      operationId: me
+      summary: Who is authenticated
+      description: |
+        `{ "login": "<github login>", "via": "session" }` for the owner, or
+        `{ "login": "claude-project", "via": "agent" }` for the agent key.
+      responses:
+        "200":
+          description: The caller.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+components:
+  securitySchemes:
+    agentKey:
+      type: http
+      scheme: bearer
+      description: "`Authorization: Bearer <TRACKER_AGENT_KEY>`. Writes are recorded as `claude-project`."
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: jt_session
+      description: The owner's signed session cookie, set by the GitHub sign-in. Writes are recorded as `dakota`.
+
+  parameters:
+    ApplicationId:
+      name: id
+      in: path
+      required: true
+      description: "`<company-slug>--<role-slug>--<discovered_at>`."
+      schema: { type: string, example: "gynger--senior-software-engineer-remote--2026-09-15" }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: The record's `updated_at`, exactly as the API last returned it.
+      schema: { type: string, format: date-time, example: "2026-10-07T14:00:00.000Z" }
+    OAuthCode:
+      name: code
+      in: query
+      required: true
+      description: The authorization code from GitHub. Missing gives 400.
+      schema: { type: string }
+    OAuthState:
+      name: state
+      in: query
+      required: true
+      description: Must equal the `jt_oauth_state` cookie set by `/auth/login`. Missing or different gives 400.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Validation failed. `error.details` lists `{ path, message }` per problem when there are any.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: No valid session and no valid agent key.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, example: Bearer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Not allowed (the agent key on a session-only action, or a GitHub login that is not allowed).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No record with this id.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ApplicationConflict:
+      description: |
+        The record already exists (same generated id, or same `posting_url`). `record` is the
+        existing record; use it rather than creating again.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApplicationConflictError" }
+    UnsupportedMediaType:
+      description: "The body was not sent with `Content-Type: application/json`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PreconditionRequired:
+      description: The `If-Match` header is missing.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: The agent key is over its per-minute limit.
+      headers:
+        Retry-After:
+          description: Seconds until the window resets.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Internal:
+      description: An unexpected server error. No stack trace is included.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UpstreamError:
+      description: GitHub OAuth failed during the callback (code `upstream_error`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    SignedIn:
+      description: Signed in; redirect to `/job-tracker/` with the `jt_session` cookie set.
+      headers:
+        Location:
+          schema: { type: string, example: /job-tracker/ }
+        Set-Cookie:
+          description: "`jt_session` (Path=/job-tracker, HttpOnly, Secure, SameSite=Lax, 30 days)."
+          schema: { type: string }
+
+  schemas:
+    # ---- enums -------------------------------------------------------------
+    Status:
+      type: string
+      description: |
+        Pipeline order: watching, shortlisted, preparing, applied, screen, interviewing, offer,
+        accepted. Terminal at any point: rejected, withdrawn, closed.
+      enum: [watching, shortlisted, preparing, applied, screen, interviewing, offer, accepted, rejected, withdrawn, closed]
+    WorkArrangement:
+      type: string
+      enum: [remote, hybrid, onsite]
+    PostingStatus:
+      type: string
+      enum: [live, removed, unverified]
+    MoveTiming:
+      type: string
+      enum: ["yes", "no", unknown]
+    CompSource:
+      type: string
+      enum: [posting, recruiter, estimate]
+    Track:
+      type: string
+      enum: [ai-engineer, senior-frontend, senior-fullstack, devex-platform, other]
+    CompanyStage:
+      type: string
+      enum: [startup, scaleup, public-product, enterprise, consultancy]
+    Source:
+      type: string
+      enum: [linkedin, builtin, company-site, referral, recruiter-inbound, community, other]
+    Referral:
+      type: string
+      enum: [none, asked, submitted]
+    Priority:
+      type: string
+      enum: [high, medium, low]
+    ClosedReason:
+      type: string
+      enum: [rejected, withdrew, posting-removed, no-response, declined-offer, accepted]
+    ClientEventType:
+      type: string
+      description: Event types a client may post. `status-change` is created only by the server.
+      enum: [discovered, scored, materials-drafted, applied, email, call, interview, take-home, offer, rejected, withdrew, note]
+    EventType:
+      type: string
+      enum: [discovered, scored, materials-drafted, applied, email, call, interview, take-home, offer, rejected, withdrew, note, status-change]
+    Actor:
+      type: string
+      enum: [dakota, claude-project, tracker-app]
+    Relationship:
+      type: string
+      enum: [recruiter, referral, hiring-manager, interviewer, peer]
+
+    # ---- nested objects ----------------------------------------------------
+    Fit:
+      type: object
+      description: Fit score. Unknown keys are kept.
+      additionalProperties: true
+      properties:
+        skills: { type: integer, minimum: 0, maximum: 100 }
+        experience: { type: integer, minimum: 0, maximum: 100 }
+        industry: { type: integer, minimum: 0, maximum: 100 }
+        growth: { type: integer, minimum: 0, maximum: 100 }
+        total: { type: integer, minimum: 0, maximum: 100, description: Weighted total. }
+        weights:
+          type: object
+          additionalProperties: { type: number }
+          example: { skills: 0.35, experience: 0.3, industry: 0.15, growth: 0.2 }
+        biggest_risk: { type: string }
+        gaps: { type: array, items: { type: string }, example: ["GCP/Vertex AI"] }
+        scored_at: { type: string, format: date }
+    Materials:
+      type: object
+      description: Links to the materials sent (not file contents). Unknown keys are kept.
+      additionalProperties: true
+      properties:
+        resume: { type: string }
+        cover_letter: { type: string }
+        answers: { type: string }
+        portfolio_links: { type: array, items: { type: string } }
+        email_used: { type: string }
+        checklist:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [item, done]
+            properties:
+              item: { type: string }
+              done: { type: boolean }
+
+    # ---- applications ------------------------------------------------------
+    Application:
+      type: object
+      description: |
+        An application record. Unknown fields stored in `extra` are returned as additional
+        top-level properties. List responses (`GET /applications`, `GET /due`) omit `events`,
+        `contacts` and `contact_ids`; `GET /applications/{id}`, write responses and 409/412 bodies
+        include them. The export includes `events` and `contact_ids` but not `contacts`.
+      additionalProperties: true
+      required: [id, company, role_title, work_arrangement, status, discovered_at, created_at, updated_at, updated_by]
+      properties:
+        id: { type: string, example: "gynger--senior-software-engineer-remote--2026-09-15" }
+        company: { type: string }
+        role_title: { type: string, description: Exactly as posted. }
+        posting_url: { type: [string, "null"], format: uri }
+        job_id: { type: [string, "null"] }
+        posting_status: { oneOf: [{ $ref: "#/components/schemas/PostingStatus" }, { type: "null" }] }
+        posting_verified_at: { type: [string, "null"], format: date }
+        jd_snapshot_path: { type: [string, "null"] }
+        jd_snapshot: { type: [string, "null"], description: Saved job description text. }
+        work_arrangement: { $ref: "#/components/schemas/WorkArrangement" }
+        location: { type: [string, "null"], example: "Dearborn, MI" }
+        detroit_metro: { type: [boolean, "null"] }
+        onsite_requirement: { type: [string, "null"], example: "4+ days/week" }
+        remote_scope: { type: [string, "null"], example: "US remote" }
+        move_timing_ok: { oneOf: [{ $ref: "#/components/schemas/MoveTiming" }, { type: "null" }] }
+        comp_min: { type: [integer, "null"], description: "USD per year, base." }
+        comp_max: { type: [integer, "null"], description: "USD per year, base." }
+        comp_source: { oneOf: [{ $ref: "#/components/schemas/CompSource" }, { type: "null" }] }
+        meets_floor:
+          type: [boolean, "null"]
+          description: Server-computed. `(comp_max ?? comp_min) >= comp_floor`; null when both are null. Never writable.
+        equity_bonus_notes: { type: [string, "null"] }
+        track: { oneOf: [{ $ref: "#/components/schemas/Track" }, { type: "null" }] }
+        company_archetype: { type: [string, "null"] }
+        company_stage: { oneOf: [{ $ref: "#/components/schemas/CompanyStage" }, { type: "null" }] }
+        industry: { type: [string, "null"] }
+        mission_interest: { type: [array, "null"], items: { type: string }, description: Free tags. }
+        fit: { oneOf: [{ $ref: "#/components/schemas/Fit" }, { type: "null" }] }
+        source: { oneOf: [{ $ref: "#/components/schemas/Source" }, { type: "null" }] }
+        source_detail: { type: [string, "null"] }
+        connection: { type: [string, "null"] }
+        referral: { oneOf: [{ $ref: "#/components/schemas/Referral" }, { type: "null" }] }
+        contact_ids: { type: array, items: { type: string }, description: "Linked contact ids, sorted." }
+        status: { $ref: "#/components/schemas/Status" }
+        priority: { oneOf: [{ $ref: "#/components/schemas/Priority" }, { type: "null" }] }
+        next_action: { type: [string, "null"] }
+        next_action_due: { type: [string, "null"], format: date }
+        follow_up_date: { type: [string, "null"], format: date }
+        discovered_at: { type: string, format: date }
+        applied_at: { type: [string, "null"], format: date }
+        closed_at: { type: [string, "null"], format: date }
+        closed_reason: { oneOf: [{ $ref: "#/components/schemas/ClosedReason" }, { type: "null" }] }
+        materials: { oneOf: [{ $ref: "#/components/schemas/Materials" }, { type: "null" }] }
+        notes: { type: [string, "null"] }
+        project_thread_url: { type: [string, "null"], format: uri, description: Link to the Claude project thread. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time, description: Send this back as `If-Match` on PATCH. }
+        updated_by: { $ref: "#/components/schemas/Actor" }
+        events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+        contacts: { type: array, items: { $ref: "#/components/schemas/Contact" } }
+    ApplicationFields:
+      type: object
+      description: |
+        The writable application fields. `null` means "no value" (on PATCH it clears the field).
+        Unknown top-level fields are preserved in `extra` and returned top-level.
+      additionalProperties: true
+      properties:
+        company: { type: string, minLength: 1 }
+        role_title: { type: string, minLength: 1 }
+        work_arrangement: { $ref: "#/components/schemas/WorkArrangement" }
+        status: { $ref: "#/components/schemas/Status" }
+        discovered_at: { type: string, format: date }
+        posting_url: { type: [string, "null"], format: uri }
+        job_id: { type: [string, "null"] }
+        posting_status: { oneOf: [{ $ref: "#/components/schemas/PostingStatus" }, { type: "null" }] }
+        posting_verified_at: { type: [string, "null"], format: date }
+        jd_snapshot_path: { type: [string, "null"] }
+        jd_snapshot: { type: [string, "null"] }
+        location: { type: [string, "null"] }
+        detroit_metro: { type: [boolean, "null"] }
+        onsite_requirement: { type: [string, "null"] }
+        remote_scope: { type: [string, "null"] }
+        move_timing_ok: { oneOf: [{ $ref: "#/components/schemas/MoveTiming" }, { type: "null" }] }
+        comp_min: { type: [integer, "null"] }
+        comp_max: { type: [integer, "null"] }
+        comp_source: { oneOf: [{ $ref: "#/components/schemas/CompSource" }, { type: "null" }] }
+        equity_bonus_notes: { type: [string, "null"] }
+        track: { oneOf: [{ $ref: "#/components/schemas/Track" }, { type: "null" }] }
+        company_archetype: { type: [string, "null"] }
+        company_stage: { oneOf: [{ $ref: "#/components/schemas/CompanyStage" }, { type: "null" }] }
+        industry: { type: [string, "null"] }
+        mission_interest: { type: [array, "null"], items: { type: string } }
+        fit: { oneOf: [{ $ref: "#/components/schemas/Fit" }, { type: "null" }] }
+        source: { oneOf: [{ $ref: "#/components/schemas/Source" }, { type: "null" }] }
+        source_detail: { type: [string, "null"] }
+        connection: { type: [string, "null"] }
+        referral: { oneOf: [{ $ref: "#/components/schemas/Referral" }, { type: "null" }] }
+        contact_ids:
+          type: [array, "null"]
+          items: { type: string }
+          description: |
+            Replaces the whole set of linked contacts. Sending `null` (or `[]`) clears every link.
+            Every id must name an existing contact (400 otherwise). Duplicates are ignored.
+        priority: { oneOf: [{ $ref: "#/components/schemas/Priority" }, { type: "null" }] }
+        next_action: { type: [string, "null"] }
+        next_action_due: { type: [string, "null"], format: date }
+        follow_up_date: { type: [string, "null"], format: date }
+        applied_at: { type: [string, "null"], format: date }
+        closed_at: { type: [string, "null"], format: date }
+        closed_reason: { oneOf: [{ $ref: "#/components/schemas/ClosedReason" }, { type: "null" }] }
+        materials: { oneOf: [{ $ref: "#/components/schemas/Materials" }, { type: "null" }] }
+        notes: { type: [string, "null"] }
+        project_thread_url: { type: [string, "null"], format: uri }
+    ApplicationCreate:
+      description: |
+        POST /applications body. `company`, `role_title`, `work_arrangement` and `status` are
+        required; `discovered_at` defaults to today. Unknown fields are preserved in `extra` and
+        returned top-level.
+      allOf:
+        - $ref: "#/components/schemas/ApplicationFields"
+        - type: object
+          required: [company, role_title, work_arrangement, status]
+      example:
+        company: Ford
+        role_title: AI Engineer, Agentic AI Solutions
+        work_arrangement: hybrid
+        status: watching
+        location: Dearborn, MI
+        posting_url: https://www.careers.ford.com/job/dearborn/ai-engineer-agentic-ai-solutions/48560/99130196528
+        project_thread_url: https://claude.ai/project/example/thread
+    ApplicationPatch:
+      description: |
+        PATCH /applications/{id} body. Every field is optional; `null` clears an optional field and
+        cannot be sent for a required one. Unknown fields merge into `extra` (returned top-level),
+        and `null` for one removes it.
+      allOf:
+        - $ref: "#/components/schemas/ApplicationFields"
+      example:
+        next_action: Send follow-up to recruiter
+        next_action_due: "2026-10-14"
+    ApplicationList:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          description: List records (no `events`, `contacts` or `contact_ids`).
+          items: { $ref: "#/components/schemas/Application" }
+        count: { type: integer }
+
+    # ---- events ------------------------------------------------------------
+    Event:
+      type: object
+      required: [id, application_id, at, type, note, by, from_status, to_status]
+      properties:
+        id: { type: string, format: uuid }
+        application_id: { type: string }
+        at: { type: string, format: date-time }
+        type: { $ref: "#/components/schemas/EventType" }
+        note: { type: [string, "null"], description: 'For status-change events, `"<from> → <to>"`.' }
+        by: { $ref: "#/components/schemas/Actor" }
+        from_status: { oneOf: [{ $ref: "#/components/schemas/Status" }, { type: "null" }], description: Set on status-change events. }
+        to_status: { oneOf: [{ $ref: "#/components/schemas/Status" }, { type: "null" }], description: Set on status-change events. }
+    EventCreate:
+      type: object
+      description: |
+        POST /applications/{id}/events body. Only these six fields are read. Any other key,
+        including `closed_reason` and the other application fields, is ignored and not stored
+        (events do not preserve unknown fields in `extra`). Set `closed_reason` with
+        `PATCH /applications/{id}`.
+      required: [type]
+      properties:
+        type: { $ref: "#/components/schemas/ClientEventType" }
+        note: { type: [string, "null"] }
+        at:
+          type: string
+          format: date-time
+          description: |
+            When it happened; defaults to now. An ISO 8601 datetime with an offset and a year from
+            1000 to 9999; anything else is 400 `bad_request` naming `at`.
+        status: { $ref: "#/components/schemas/Status" }
+        next_action: { type: [string, "null"] }
+        next_action_due: { type: [string, "null"], format: date }
+      example:
+        type: call
+        note: Recruiter screen booked for Tuesday.
+        status: screen
+        next_action: Prepare for recruiter screen
+        next_action_due: "2026-10-13"
+    EventResult:
+      type: object
+      required: [event, record]
+      properties:
+        event: { $ref: "#/components/schemas/Event" }
+        record: { $ref: "#/components/schemas/Application" }
+
+    # ---- contacts ----------------------------------------------------------
+    Contact:
+      type: object
+      description: A contact. Unknown fields stored in `extra` are returned as additional top-level properties.
+      additionalProperties: true
+      required: [id, name, created_at, updated_at, updated_by]
+      properties:
+        id: { type: string, example: "jane-doe--ford" }
+        name: { type: string }
+        company: { type: [string, "null"] }
+        role: { type: [string, "null"] }
+        relationship: { oneOf: [{ $ref: "#/components/schemas/Relationship" }, { type: "null" }] }
+        linkedin_url: { type: [string, "null"], format: uri }
+        email: { type: [string, "null"] }
+        last_contact_at: { type: [string, "null"], format: date }
+        notes: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        updated_by: { $ref: "#/components/schemas/Actor" }
+        application_ids: { type: array, items: { type: string }, description: "Linked application ids, sorted." }
+    ContactFields:
+      type: object
+      description: Writable contact fields. Unknown fields are preserved in `extra` and returned top-level.
+      additionalProperties: true
+      properties:
+        name: { type: string, minLength: 1 }
+        company: { type: [string, "null"] }
+        role: { type: [string, "null"] }
+        relationship: { oneOf: [{ $ref: "#/components/schemas/Relationship" }, { type: "null" }] }
+        linkedin_url: { type: [string, "null"], format: uri }
+        email: { type: [string, "null"] }
+        last_contact_at: { type: [string, "null"], format: date }
+        notes: { type: [string, "null"] }
+    ContactCreate:
+      description: POST /contacts body. `name` is required.
+      allOf:
+        - $ref: "#/components/schemas/ContactFields"
+        - type: object
+          required: [name]
+    ContactPatch:
+      description: PATCH /contacts/{id} body. Every field optional; `null` clears an optional field.
+      allOf:
+        - $ref: "#/components/schemas/ContactFields"
+    ContactList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Contact" } }
+        count: { type: integer }
+
+    # ---- views and export --------------------------------------------------
+    DueItem:
+      description: A list record plus when it is due.
+      allOf:
+        - $ref: "#/components/schemas/Application"
+        - type: object
+          required: [due_on, overdue]
+          properties:
+            due_on: { type: string, format: date, description: The earlier of next_action_due and follow_up_date. }
+            overdue: { type: boolean, description: "`due_on` is before `date`." }
+    DueResponse:
+      type: object
+      required: [date, items]
+      properties:
+        date: { type: string, format: date }
+        items: { type: array, items: { $ref: "#/components/schemas/DueItem" } }
+    SourceRow:
+      type: object
+      required: [source, applied, responded, interviewed, response_rate]
+      properties:
+        source: { type: string, description: "The source enum value, or `unknown` when null." }
+        applied: { type: integer }
+        responded: { type: integer }
+        interviewed: { type: integer }
+        response_rate: { type: number, description: "responded / applied, rounded to 2 decimals." }
+    Summary:
+      type: object
+      required: [from, to, applied, responses, interviews, by_status, by_source]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        applied: { type: integer, description: Applications with applied_at in the window. }
+        responses:
+          type: integer
+          description: Distinct applications with a status-change in the window to screen, interviewing, offer or rejected.
+        interviews: { type: integer, description: Events of type interview in the window (local dates). }
+        by_status:
+          type: object
+          description: Current count per status, all-time. Every status is present.
+          additionalProperties: { type: integer }
+        by_source:
+          type: array
+          description: All-time, over applications with applied_at set; sorted by source.
+          items: { $ref: "#/components/schemas/SourceRow" }
+    Export:
+      type: object
+      required: [exported_at, applications, contacts, settings]
+      properties:
+        exported_at: { type: string, format: date-time }
+        applications:
+          type: array
+          description: Full records with `events` and `contact_ids` (no embedded `contacts`), sorted by id.
+          items: { $ref: "#/components/schemas/Application" }
+        contacts:
+          type: array
+          description: Contacts with `application_ids`, sorted by id.
+          items: { $ref: "#/components/schemas/Contact" }
+        settings:
+          type: object
+          required: [comp_floor]
+          properties:
+            comp_floor: { type: integer, example: 150000 }
+    Me:
+      type: object
+      required: [login, via]
+      properties:
+        login: { type: string, example: claude-project }
+        via: { type: string, enum: [session, agent] }
+
+    # ---- errors ------------------------------------------------------------
+    Error:
+      type: object
+      description: The error envelope for every non-2xx JSON response.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - bad_request
+                - unauthorized
+                - forbidden
+                - not_found
+                - conflict
+                - precondition_failed
+                - unsupported_media_type
+                - precondition_required
+                - rate_limited
+                - internal
+                - upstream_error
+            message: { type: string }
+            details:
+              description: For 400, a list of `{ path, message }` (path is dotted, e.g. `fit.total`).
+              type: array
+              items:
+                type: object
+                required: [path, message]
+                properties:
+                  path: { type: string }
+                  message: { type: string }
+    ApplicationConflictError:
+      description: A 409 or 412 for an application. `record` is the full current record.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [record]
+          properties:
+            record: { $ref: "#/components/schemas/Application" }
+    ContactConflictError:
+      description: A 409 or 412 for a contact. `record` is the current contact.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [record]
+          properties:
+            record: { $ref: "#/components/schemas/Contact" }
