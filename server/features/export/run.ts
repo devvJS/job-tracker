@@ -3,6 +3,7 @@
 import type { Db } from "../../db.ts";
 import { buildExport, type ExportDump } from "./build.ts";
 import { createGitClient, type GitHubTarget, type TreeEntry } from "./git.ts";
+import { recordLastExport } from "./last-run.ts";
 import { compareCodeUnits } from "./util.ts";
 
 export type RunExportOptions = { db: Db; now: () => Date; github: GitHubTarget };
@@ -61,10 +62,22 @@ export async function runExport(opts: RunExportOptions): Promise<RunExportResult
     entries = withSha;
   }
 
+  // last_export_at is recorded only once the run has fully succeeded (an unchanged tree counts),
+  // so a failure anywhere above leaves the previous value in place.
   const tree = await git.createTree(entries);
-  if (tree === currentTree) return { committed: false, files: files.size };
+  if (tree === currentTree) {
+    await recordLastExport(opts.db, dump.exported_at);
+    return { committed: false, files: files.size };
+  }
 
   const commitSha = await git.createCommit(`Export ${dump.exported_at}`, tree, [head]);
   await git.updateBranch(commitSha);
+  try {
+    await recordLastExport(opts.db, dump.exported_at);
+  } catch (err) {
+    // The commit is on the branch; say so, so whoever reads the failure doesn't think the data is lost.
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`export: committed ${commitSha} but recording last_export_at failed: ${reason}`, { cause: err });
+  }
   return { committed: true, commitSha, files: files.size };
 }

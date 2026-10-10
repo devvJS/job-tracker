@@ -108,6 +108,6 @@ describe("HTML gating", () => {
   it("/healthz is public", async () => {
     const res = await get("/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
   });
 });
