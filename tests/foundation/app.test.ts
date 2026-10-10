@@ -32,7 +32,7 @@ describe("foundation routes", () => {
   it("GET /job-tracker/healthz -> 200 {ok:true} with noindex, no auth needed", async () => {
     const res = await built!.app.request("/job-tracker/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
     expect(res.headers.get("x-robots-tag")).toBe("noindex");
   });
 
@@ -272,7 +272,7 @@ describe("root healthz (Railway health check path)", () => {
     built = await buildTestApp();
     const res = await built.app.request("/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
     expect(res.headers.get("x-robots-tag")).toBe("noindex");
   });
 
@@ -280,7 +280,7 @@ describe("root healthz (Railway health check path)", () => {
     built = await buildTestApp();
     const res = await built.app.request("/job-tracker/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
     expect(res.headers.get("x-robots-tag")).toBe("noindex");
   });
 

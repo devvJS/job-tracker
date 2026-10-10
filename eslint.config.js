@@ -5,13 +5,13 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/", ".e2e/", ".data/", "coverage/", "test-results/", "playwright-report/", "db/migrations/"],
+    ignores: ["dist/", ".e2e/", ".data/", "coverage/", "test-results/", "playwright-report/", "db/migrations/", ".swarm/"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
     // Server, database, scripts, shared code, tests and tool configs run on Node.
-    files: ["**/*.{ts,js}"],
+    files: ["**/*.{ts,js,mjs}"],
     languageOptions: { globals: globals.node },
   },
   {

@@ -2,7 +2,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
@@ -13,6 +12,7 @@ import authRoutes from "./auth/routes.ts";
 import { type AppDeps, type AppEnv, jsonError } from "./context.ts";
 import applicationRoutes from "./features/applications/routes.ts";
 import contactRoutes from "./features/contacts/routes.ts";
+import { readLastExport } from "./features/export/last-run.ts";
 import exportRoutes from "./features/export/routes.ts";
 import openapiRoutes from "./features/openapi/routes.ts";
 import viewRoutes from "./features/views/routes.ts";
@@ -90,9 +90,10 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
 
   // One public health check on two paths. Railway's health-check path field rejects the hyphen
   // in /job-tracker/healthz, so /healthz serves the same handler.
+  // Reading last_export_at is the database check: if it throws, onError answers 500.
   app.on("GET", [HEALTHZ_PATH, ROOT_HEALTHZ_PATH], async (c) => {
-    await c.get("deps").db.execute(sql`select 1`);
-    return c.json({ ok: true });
+    const lastExportAt = await readLastExport(c.get("deps").db);
+    return c.json({ ok: true, lastExportAt });
   });
 
   app.get(BASE_PATH, (c) => c.redirect(`${BASE_PATH}/${new URL(c.req.url).search}`, 301));
