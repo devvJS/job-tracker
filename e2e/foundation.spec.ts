@@ -10,7 +10,7 @@ test("the browser loads /job-tracker/ and renders the app shell", async ({ page 
 test("healthz returns {ok:true} with noindex", async ({ request }) => {
   const res = await request.get("/job-tracker/healthz");
   expect(res.status()).toBe(200);
-  expect(await res.json()).toEqual({ ok: true });
+  expect(await res.json()).toEqual({ ok: true, lastExportAt: null });
   expect(res.headers()["x-robots-tag"]).toBe("noindex");
 });
 
@@ -20,5 +20,5 @@ test("the browser's own healthz request returns {ok:true}", async ({ page }) => 
     const r = await fetch("/job-tracker/healthz");
     return { status: r.status, json: await r.json() };
   });
-  expect(body).toEqual({ status: 200, json: { ok: true } });
+  expect(body).toEqual({ status: 200, json: { ok: true, lastExportAt: null } });
 });
